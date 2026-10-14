@@ -1,0 +1,55 @@
+# QQ Agent + NapCat 容器编排
+#
+#   启动：docker compose -f deploy/docker-compose.yml up -d
+#   日志：docker compose -f deploy/docker-compose.yml logs -f
+#   停止：docker compose -f deploy/docker-compose.yml down
+#
+# ⚠️ 所有端口只绑 127.0.0.1：控制台与 WebUI 一律走 SSH 隧道访问，不暴露公网。
+# ⚠️ 两个数据/插件目录必须保留挂载，否则重建容器会丢配置与插件：
+#      data/    配置、聊天存档、记忆、会话记录、用量、插件数据
+#      plugins/ 市场口令安装的插件本体（放在容器可写层里会在重建时丢失）
+services:
+
+  # ── 协议端：NapCat（官方镜像，负责登 QQ 并提供 OneBot v11）──
+  napcat:
+    image: mlikiowa/napcat-docker:latest
+    container_name: napcat
+    restart: always
+    environment:
+      - NAPCAT_UID=${NAPCAT_UID:-1000}
+      - NAPCAT_GID=${NAPCAT_GID:-1000}
+      - WEBUI_TOKEN=${WEBUI_TOKEN:-change-me}
+      - ACCOUNT=${QQ_ACCOUNT:-}
+    ports:
+      - 127.0.0.1:3000:3000     # OneBot HTTP API
+      - 127.0.0.1:3001:3001     # OneBot 正向 WebSocket（本项目主要用这个）
+      - 127.0.0.1:6099:6099     # NapCat WebUI（扫码登录、网络配置）
+    volumes:
+      - ./napcat/config:/app/napcat/config
+      - ./napcat/QQ:/app/.config/QQ     # 登录态；不挂会每次重启都要重扫
+    shm_size: 256m                      # QQ 客户端是 Chromium 内核，64M 会崩
+    networks: [qqnet]
+
+  # ── 大脑：QQ Agent ──
+  qq-agent:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: qq-agent:local
+    container_name: qq-agent
+    restart: always
+    depends_on: [napcat]
+    environment:
+      - TZ=Asia/Shanghai
+      - NODE_ENV=production
+      - QQ_AGENT_DATA_DIR=/app/data
+    ports:
+      - 127.0.0.1:3210:3210     # 会话式控制台
+    volumes:
+      - ./data:/app/data
+      - ./plugins:/app/plugins
+    networks: [qqnet]
+
+networks:
+  qqnet:
+    driver: bridge

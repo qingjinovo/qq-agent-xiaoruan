@@ -1,0 +1,37 @@
+# ── 运行时数据：绝不能入库 ──
+# 说明：deploy/data 含明文 API Key（config.json）、聊天存档、群友记忆、会话记录；
+#       deploy/napcat 含 QQ 登录态。三个目录都必须在忽略列表里。
+deploy/data/
+deploy/napcat/
+deploy/plugins/
+data/
+napcat/
+plugins/
+*.lock
+
+# ── 二进制与依赖 ──
+node_modules/
+# 注意：只挡 app/snowluma/（113MB 的 Node 运行时与 DLL），
+# 不能写成 `snowluma/` —— 那会连 app/ui/app/03-snowluma.js 这个前端源码一起挡掉
+app/snowluma/
+*.exe
+*.dll
+*.node
+*.pak
+*.bin
+*.dat
+*.tar.gz
+locales/
+
+# ── 个人信息与凭据 ──
+.env
+*.pem
+*.key
+config.json
+
+# ── 编辑器/系统 ──
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+__pycache__/
