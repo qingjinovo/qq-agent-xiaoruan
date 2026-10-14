@@ -31,9 +31,11 @@ function check(name, actual, expected) {
 // 身份用占位值：本仓库是公开的，测试数据里不必出现真实的 QQ 号/昵称。
 const atCtx = { selfNickname: '小软', botName: '小软', selfId: '10000' };
 const chatCfg = {
-  contextTier: 2, randomPercent: 0,
+  contextTier: 2,          // 2 档：被 @ 或命中关键词才召唤
+  randomPercent: 0,
   keywords: ['小软'], historyCount: 80,
   chatWindowMs: WINDOW_MS,
+  chatWindowProb: 100,     // 本文件只测"窗口计时"，概率设为 100 以隔离变量
 };
 
 function makeMachine() {
@@ -51,7 +53,8 @@ function makeMachine() {
 
       const out = resolveWithChatWindow({
         atMe, windowOpen: untilIn > clock, resolved: base,
-        windowMs, equalCount: base.count, windowCount: chatCfg.historyCount,
+        windowMs, windowProb: chatCfg.chatWindowProb, roll: null,
+        equalCount: base.count, windowCount: chatCfg.historyCount,
       });
 
       // ★ 与 orchestrator 修正后的逻辑逐字对应

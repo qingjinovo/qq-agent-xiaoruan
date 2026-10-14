@@ -302,10 +302,18 @@ export class Orchestrator {
    * 档位判定 + 连续对话窗口（新增，2026-10-14）。
    *
    * 包住 resolveContextTier，并叠加"连续对话窗口"：被召唤（艾特 / 关键词命中）后
-   * 开启一个时间窗，窗口内该群的**普通消息也触发响应**，不必每条都重新 @。
+   * 开启一个时间窗，窗口内该群的普通消息按概率触发响应，不必每条都重新 @。
    *
    * ⚠️ 所有判定点都必须走这里，不能直接调 resolveContextTier ——
    *    否则会出现"实际按窗口响应了，但会话记录写成 tier=0/未触发"的自相矛盾。
+   *
+   * 📌 概率的语义（2026-10-14 修订，别搞混）：
+   *    · 窗口外 + 没召唤 → **一定不响应**（机器人平常不主动插话）
+   *    · 窗口内         → 按 chatWindowProb 掷骰子决定接不接这句话
+   *    · 召唤（@ / 关键词）→ 必响应，并开启/续期窗口
+   *    窗口外的普通消息**不再**走档位的 randomPercent 概率 —— 那条路会让机器人在
+   *    没人叫它的时候也按概率插话，正式群里太吵。randomPercent 仍然按档位规则计算，
+   *    只是窗口在的时候由 chatWindowProb 决定接话与否。
    *
    * @param {string} chatKey
    * @param {Array}  triggerEntries 参与判定的消息（onIncoming 传单条，wake 传整批）
@@ -339,11 +347,38 @@ export class Orchestrator {
     const atMe = triggerEntries.some((e) => isAtMe(e?.text, atCtx))
       || base.reason === '关键词命中';
 
+    // 窗口内接话概率（优先级从高到低）：
+    //   1) chatWindowProbByGroup[群号]  —— 分群覆盖（群号从 chatKey 里取，private: 不适用）
+    //   2) chatWindowProb              —— 全局值
+    //   3) randomPercent               —— 兼容只设了滑条的旧配置
+    //   4) 100                         —— 都没设 = 窗口内必接
+    const groupId = (() => {
+      const [kind, id] = String(chatKey || '').split(':');
+      return kind === 'group' && id ? id : '';
+    })();
+    const byGroup = chatCfg?.chatWindowProbByGroup;
+    const perGroup = groupId && byGroup && typeof byGroup === 'object' ? byGroup[groupId] : undefined;
+    // 注意：Number(null) === 0，不能用 Number.isFinite(Number(x)) 判"有没有给值"
+    const pick = (v) => {
+      if (v === null || v === undefined || v === '') return null;
+      const n = Number(v);
+      return Number.isFinite(n) ? n : null;
+    };
+    const windowProb = (() => {
+      const candidates = [pick(perGroup), pick(chatCfg?.chatWindowProb), pick(chatCfg?.randomPercent)];
+      for (const c of candidates) {
+        if (c !== null) return Math.max(0, Math.min(100, c));
+      }
+      return 100;
+    })();
+
     const out = resolveWithChatWindow({
       atMe,
       windowOpen: untilIn > now,
       resolved: base,
       windowMs,
+      windowProb,
+      roll: null,               // 内部现掷：单条判定当场出结果
       equalCount: base.count,
       windowCount: chatCfg?.historyCount,
     });
@@ -354,7 +389,7 @@ export class Orchestrator {
     //    正确语义：窗口从**最后一次召唤（@ 或关键词）**起算，普通消息只受益、不续期。
     if (out.opened) {
       this.chatWindowUntil.set(chatKey, now + windowMs);
-      console.log(`[窗口] 开启连续对话窗口 ${Math.round(windowMs / 1000)}s（${chatKey}，触发：${out.reason}）`);
+      console.log(`[窗口] 开启连续对话窗口 ${Math.round(windowMs / 1000)}s（${chatKey}，触发：${out.reason}，窗口内接话概率 ${windowProb}%）`);
     } else if (atMe) {
       // 窗口内被再次召唤：从这次召唤重新计时（这是唯一允许续期的情况）
       this.chatWindowUntil.set(chatKey, now + windowMs);

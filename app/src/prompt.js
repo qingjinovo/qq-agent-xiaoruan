@@ -534,23 +534,33 @@ export function resolveContextTier({ triggerEntries = [], selfNickname = '', bot
 }
 
 /**
- * 连续对话窗口 —— 被召唤（艾特或关键词命中）之后的一段时间内，普通消息也算触发。
+ * 连续对话窗口 —— 被召唤（艾特或关键词命中）之后的一段时间内，普通消息也可能触发。
  *
  * 场景：群里 @ 一次机器人，然后连着聊几句，不该每条都重新 @。
  *
  * ⚠️ 本函数**必须保持纯函数**：不读时钟、不写外部状态，时间基准由调用方以
  *    `now` / `windowUntil` 传入。这样编排器能把它当单一真相用，也便于单测。
  *
- * 语义：
- *   · 命中召唤（atMe）→ 窗口续期至 now + windowMs，返回原判定（谁召唤的就按谁的档）
- *   · 窗口内          → 普通消息也触发，reason='连续对话窗口'，条数用 windowCount
- *   · 窗口已过期      → 返回 windowUntil=0，由调用方清掉记录
- *   · windowMs <= 0   → 功能关闭，原样返回（windowUntil 归零）
+ * 语义（2026-10-14 修订：概率的含义变了）：
+ *   · 命中召唤（atMe）→ 必响应，窗口续期，返回原判定（谁召唤的就按谁的档）
+ *   · 窗口内          → 按 windowProb 掷骰子**决定要不要接这句话**
+ *                       命中 → tier=9 / reason='连续对话窗口'
+ *                       未命中 → 不响应（reason 标注"窗口内未命中"），窗口不动
+ *   · 窗口外、且没召唤 → **一定不响应**（这是默认态，机器人不主动插话）
+ *   · 窗口已过期      → 返回 windowOpen=false，由调用方清掉记录
+ *   · windowMs <= 0   → 功能关闭，原样返回
  *
- * @param {boolean} opts.atMe          本批消息是否艾特了机器人
+ * 📌 为什么概率放在窗口里，而不是放在"普通消息"上：
+ *    档位系统的 randomPercent（3 档）语义是"没被叫时按概率主动插话"，
+ *    那在正式群里太吵。这里的 windowProb 是"被叫过之后、接着聊时接话的概率"——
+ *    窗口外一律安静，窗口内按概率接话。两者是不同维度的东西，不要混用。
+ *
+ * @param {boolean} opts.atMe          本批消息是否召唤了机器人（艾特 / 关键词）
  * @param {boolean} opts.windowOpen    调用方判定窗口当前是否有效（时间戳比较在调用方做）
  * @param {object}  opts.resolved      原档位判定结果 {tier,count,reason,shouldRespond}
- * @param {number}  [opts.equalCount]  召唤成功时带的已读条数（沿用 resolved.count）
+ * @param {number}  [opts.windowProb]  窗口内接话概率 0~100；省略或 >=100 表示必接
+ * @param {number}  [opts.roll]        骰子值 0~100（调用方传入，便于测试与排查）
+ * @param {number}  [opts.equalCount]  召唤成功时带的已读条数（默认沿用 resolved.count）
  * @param {number}  [opts.windowCount] 窗口内响应时带的已读条数
  * @returns {{tier:number,count:number,reason:string,shouldRespond:boolean,windowOpen:boolean,opened:boolean,closed:boolean}}
  */
@@ -559,6 +569,8 @@ export function resolveWithChatWindow({
   windowOpen = false,
   resolved = null,
   windowMs = 0,
+  windowProb = 100,
+  roll = null,
   equalCount = 0,
   windowCount = 8,
 } = {}) {
@@ -583,17 +595,40 @@ export function resolveWithChatWindow({
     };
   }
 
-  // 原档位已命中：按原档走，窗口保持不变
+  // 原档位已命中（例如 3 档的随机命中）：按原档走，窗口保持不变
   if (base.shouldRespond) {
     return { ...base, windowOpen, opened: false, closed: false };
   }
 
-  // 窗口内：普通消息也触发
+  // 窗口内：按概率决定接不接这句
   if (windowOpen) {
+    // ⚠️ 不能用 Number.isFinite(Number(x)) 判空：Number(null) === 0、Number('') === 0，
+    //    会把"没给值"当成"概率 0"或"骰子 0"（后者会让概率彻底失效、永远命中）。
+    //    所以先排除 null/undefined/空串，再转数字。
+    const numOr = (v, dflt) => {
+      if (v === null || v === undefined || v === '') return dflt;
+      const n = Number(v);
+      return Number.isFinite(n) ? n : dflt;
+    };
+    const prob = Math.max(0, Math.min(100, numOr(windowProb, 100)));
+    // 骰子值：调用方没给就现掷（单条判定当场出结果，符合"没有预判/实跑两阶段"的设计）
+    const value = Math.max(0, Math.min(100, numOr(roll, Math.random() * 100)));
+    if (value >= prob) {
+      // 未命中：这句话不接，但窗口本身不动（不续期、不关闭）
+      return {
+        tier: 0,
+        count: 0,
+        reason: `连续对话窗口内未命中(${value.toFixed(0)}%≥${prob}%)`,
+        shouldRespond: false,
+        windowOpen: true,
+        opened: false,
+        closed: false,
+      };
+    }
     return {
       tier: 9,
       count: n0(windowCount),
-      reason: '连续对话窗口',
+      reason: `连续对话窗口(${value.toFixed(0)}%<${prob}%)`,
       shouldRespond: true,
       windowOpen: true,
       opened: false,
@@ -601,7 +636,7 @@ export function resolveWithChatWindow({
     };
   }
 
-  // 无窗口、也没命中：原样不响应
+  // 窗口外、也没被召唤：一定不响应（默认态）
   return { ...base, windowOpen: false, opened: false, closed: false };
 }
 
