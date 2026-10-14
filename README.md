@@ -192,8 +192,71 @@ python tools/install-market-plugins.py CODE1 CODE2 CODE3
 | `audit-sessions.py` | 审计会话记录与实际行为是否自洽（例如"标记未触发却发了消息"） |
 | `prepare-upgrade.py` | 跨版本升级前准备候选源码（复制 + 打补丁 + 依赖校验） |
 | `fix-prompt-restore.py` / `fix-prompt-final.py` | 从基线恢复源码并重新应用角色卡补丁（事故恢复用） |
-| `prepare-repo.py` | 生成本仓库内容（只收源码与文档 + 安全检查） |
+| `ops-sanitize.py` | 生成脱敏后的运维脚本（把硬编码的 WebUI token 抽成从 `.env` 读） |
+| `prepare-repo.py` | 生成本仓库内容（只收源码与文档 + 安全检查），模板在 `tools/repo-readme.md` |
 | `ssh_exec.py` | 用 paramiko 执行远程命令/传文件（Windows 自带 ssh 拒绝从管道读密码，故需要它） |
+
+---
+
+## 运维脚本（deploy/ops + deploy/systemd）
+
+机器人上线后最容易出的事不是崩，而是**悄悄掉线没人知道**（本项目实测掉过 20 天：
+告警只写进一个没人看的文件）。这两个脚本就是补这个洞。
+
+### `deploy/ops/napcat-guard.sh` —— 掉线守护
+
+每 30 秒检查一次，判定顺序**从最可靠到兜底**：
+
+1. `napcat` 容器是否在运行
+2. 宿主机 `127.0.0.1:3001` 是否在监听（OneBot WS 端口已发布到回环）
+3. **通过 NapCat WebUI 接口问账号是否真的登录着** ← 最关键的判据
+4. 日志里最后一次「账号状态变更」是否已被后续登录覆盖
+
+输出三态，写进 `/opt/qq/napcat-status.txt`，并在**状态发生变化时**往 journald 写 `[NAPWARN]`：
+
+| 状态 | 含义 |
+|---|---|
+| `OK` | 容器在跑、端口在听、账号已登录 |
+| `KICKED` | 被腾讯踢下线，NapCat 停在二维码页，**需要人工扫码** |
+| `DOWN` | 容器或端口异常（NapCat 通常会自动重启） |
+
+三个踩过的坑，代码里都有注释标注：
+
+- **别用 `docker exec napcat ss/netstat`** 判端口 —— NapCat 镜像里没这两个工具，会永远误报 DOWN
+- **WebUI 登录接口每分钟限流 3 次，而本脚本每 30 秒跑一次** —— 凭据必须缓存复用，只在 401 时重登；否则每次跑都触发限流，状态被误判成 `KICKED`
+- **在线态只能看"最后一次被踢之后"的日志** —— 否则刚登录成功也会显示"离线"，因为被踢那次的记录还在
+
+### `deploy/ops/qr-server.py` —— 实时二维码网页
+
+**为什么需要**：NapCat 的登录二维码约每 2 分钟自动轮换，所以任何"发一次就固定的图片"都会很快失效（本项目早期给用户发过静态二维码，扫的时候早过期了）。这个服务在网页上**每次请求都现取现画**，页面每 30 秒自动换一张新码。
+
+只监听 `127.0.0.1:6098`，不对外暴露，走 SSH 隧道访问。
+
+### 安装
+
+```bash
+sudo install -m 755 deploy/ops/napcat-guard.sh /opt/qq/napcat-guard.sh
+sudo install -m 755 deploy/ops/qr-server.py   /opt/qq/qr-server.py
+sudo install -m 644 deploy/systemd/*.service deploy/systemd/*.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now napcat-guard.timer qr-server.service
+
+# 二维码依赖（实时画码用）
+sudo apt-get install -y python3-qrcode    # 或 pip3 install qrcode[pil]
+```
+
+> **凭据处理**：这两个脚本都需要 NapCat WebUI 的 token，但**仓库里不写明文** ——
+> `napcat-guard.sh` 从 `/opt/qq/.env` 读 `WEBUI_TOKEN`，`qr-server.service` 用
+> `EnvironmentFile=/opt/qq/.env` 注入 `NAPCAT_WEBUI_TOKEN`。
+> `.env` 在 `.gitignore` 里，绝不应该入库。
+
+### 查看状态
+
+```bash
+cat /opt/qq/napcat-status.txt                      # 人可读的摘要
+journalctl -t napcat-guard -n 20                   # 状态变化的历史告警
+systemctl list-timers napcat-guard.timer           # 下次检查时间
+```
 
 ---
 
@@ -211,6 +274,17 @@ python tools/install-market-plugins.py CODE1 CODE2 CODE3
    本仓库的 Python 脚本不受影响；`.bat` 文件必须纯 ASCII + CRLF。
 5. **`docker compose` 的命名卷会加项目名前缀**：`qq-agent-data` 实际叫 `qq_qq-agent-data`，
    往宿主同名目录写配置容器读不到。用 bind mount 更省心。
+6. **给机器人装的东西，位置决定生死**：插件装进容器可写层（`/app/plugins`），
+   每次 `--force-recreate` 就全没；装进 bind mount 才活得下来。**部署后第一件事就是
+   确认三个目录都在挂载表里**：`data/`、`plugins/`、`napcat/`。
+7. **凭据不要写进脚本**：运维脚本里硬编码 WebUI token 是最容易犯的错 —— 一旦要开源
+   或分享给朋友，就等于把凭据一起给了。本仓库的做法是脚本从 `.env` 读，
+   `.env` 进 `.gitignore`（见 `deploy/systemd/qr-server.service` 的 `EnvironmentFile`）。
+8. **"重新生成内容"的脚本必须连文档一起生成**：本仓库第一版 `prepare-repo.py`
+   只生成源码，清理旧内容时把手工写的 README 删了。凡是"会清空输出目录"的工具，
+   要么把文档也纳入生成，要么显式跳过它。
+9. **不要对 git 工作目录做递归强删**：`shutil.rmtree()` 会把 `.git` 一起删掉，
+   在 Windows 上还会因只读属性抛 `PermissionError`。清理时逐个删顶层条目并跳过 `.git`。
 
 ---
 

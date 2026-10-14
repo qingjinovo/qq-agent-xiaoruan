@@ -1,13 +1,11 @@
-# 一律用 LF 入库。
-# 本仓库的 .sh / 无扩展名脚本要传进 Linux 容器执行（bash -s），
-# 若被 Windows 的 core.autocrlf 改成 CRLF，会在远端报 $'\r': command not found。
+# 一律用 LF 入库（脚本要传进 Linux 容器执行）
 * text=auto eol=lf
 
 # Windows 批处理必须是 CRLF（cmd.exe 对 LF 结尾的标签跳转有已知问题）
 *.bat text eol=crlf
 *.cmd text eol=crlf
 
-# 二进制（避免 Git 尝试做换行转换与 diff）
+# 二进制：避免 Git 做换行转换与文本 diff
 *.png binary
 *.jpg binary
 *.jpeg binary
@@ -20,6 +18,3 @@
 *.otf binary
 *.zip binary
 *.gz binary
-
-# 让 GitHub 语言统计更准确：生成物与文档不计入
-tools/*.py linguist-language=Python

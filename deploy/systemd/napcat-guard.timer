@@ -1,0 +1,11 @@
+[Unit]
+Description=每 30 秒运行一次 NapCat 掉线守护
+
+[Timer]
+OnBootSec=60
+OnUnitActiveSec=30
+AccuracySec=5s
+Unit=napcat-guard.service
+
+[Install]
+WantedBy=timers.target

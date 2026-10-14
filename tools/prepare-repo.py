@@ -63,9 +63,19 @@ def main():
         print("   ✅ 已确认 data/ 不在收集范围内（含 API Key 与聊天记录）")
 
     if os.path.isdir(OUT):
-        print("   清空旧目录: %s" % OUT)
-        shutil.rmtree(OUT)
-    os.makedirs(OUT)
+        # ⚠️ 不能整目录删 —— repo/ 是 git 仓库，rmtree 会连 .git 一起删掉，
+        #    而且递归强删在 Windows 上常因只读属性失败。
+        #    这里逐个删"顶层条目"，显式跳过 .git。
+        print("   清理旧内容（保留 .git）: %s" % OUT)
+        for name in os.listdir(OUT):
+            if name == ".git":
+                continue
+            p = os.path.join(OUT, name)
+            if os.path.isdir(p):
+                shutil.rmtree(p)
+            else:
+                os.remove(p)
+    os.makedirs(OUT, exist_ok=True)
 
     # ── 1. 应用源码（跳过 snowluma / node_modules / electron） ──
     print("\n=== 1. 收集应用源码 ===")
@@ -212,6 +222,28 @@ networks:
     write(os.path.join(deploy, "docker-compose.yml"), compose)
     print("   deploy/docker-compose.yml")
 
+    # ── 4b. 运维脚本（已脱敏：凭据从 .env 读，不写死在文件里） ──
+    print("\n=== 4b. 收集运维脚本 ===")
+    ops_src = os.path.join(WS, "ops-sanitized", "ops-sanitized")
+    if os.path.isdir(ops_src):
+        ops_out = os.path.join(deploy, "ops")
+        sysd_out = os.path.join(deploy, "systemd")
+        os.makedirs(ops_out, exist_ok=True)
+        os.makedirs(sysd_out, exist_ok=True)
+        for f in ["napcat-guard.sh", "qr-server.py"]:
+            s = os.path.join(ops_src, f)
+            if os.path.exists(s):
+                shutil.copy2(s, os.path.join(ops_out, f))
+                print("   deploy/ops/%s" % f)
+        for f in ["napcat-guard.service", "napcat-guard.timer", "qr-server.service"]:
+            s = os.path.join(ops_src, "systemd", f)
+            if os.path.exists(s):
+                shutil.copy2(s, os.path.join(sysd_out, f))
+                print("   deploy/systemd/%s" % f)
+    else:
+        print("   ⚠️ 找不到 %s，跳过运维脚本" % ops_src)
+        print("      （先在服务器上跑 tools/ops-sanitize.py 生成脱敏版）")
+
     # ── 5. .gitignore ──
     print("\n=== 5. 写 .gitignore ===")
     gitignore = """# ── 运行时数据：绝不能入库 ──
@@ -249,13 +281,52 @@ __pycache__/
     write(os.path.join(OUT, ".gitignore"), gitignore)
     print("   .gitignore（已排除 data/、二进制、密钥）")
 
+    # ── 5b. .gitattributes：强制 LF ──
+    # 本仓库的脚本要传进 Linux 容器执行，若被 Windows 的 core.autocrlf 改成 CRLF，
+    # 远端会报 $'\r': command not found。
+    gitattributes = """# 一律用 LF 入库（脚本要传进 Linux 容器执行）
+* text=auto eol=lf
+
+# Windows 批处理必须是 CRLF（cmd.exe 对 LF 结尾的标签跳转有已知问题）
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 二进制：避免 Git 做换行转换与文本 diff
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.otf binary
+*.zip binary
+*.gz binary
+"""
+    write(os.path.join(OUT, ".gitattributes"), gitattributes)
+    print("   .gitattributes（强制 LF，.bat 用 CRLF）")
+
+    # ── 5c. README ──
+    # 与源码一起生成，避免"重新生成内容时把文档删掉"这类事故。
+    here = os.path.dirname(os.path.abspath(__file__))
+    tmpl = os.path.join(here, "repo-readme.md")
+    if os.path.exists(tmpl):
+        shutil.copy2(tmpl, os.path.join(OUT, "README.md"))
+        print("   README.md（来自 tools/repo-readme.md，%d 字节）" % os.path.getsize(tmpl))
+    else:
+        print("   ⚠️ 找不到 tools/repo-readme.md，README 未生成")
+
     # ── 6. 汇总 ──
     print("\n=== 6. 汇总 ===")
     total = 0
     for root, dirs, files in os.walk(OUT):
+        # 统计交付内容时不算 .git 内部文件（否则会把几万个对象文件算进来）
+        dirs[:] = [d for d in dirs if d != ".git"]
         total += len(files)
     print("   输出目录: %s" % OUT)
-    print("   文件总数: %d" % total)
+    print("   交付文件数: %d（不含 .git）" % total)
 
     # 二次确认：目录里不能出现 data/、API Key、真实服务器地址
     print("\n   === 安全检查 ===")

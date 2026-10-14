@@ -28,7 +28,8 @@ function check(name, actual, expected) {
 }
 
 // ── 重演 orchestrator #resolveTier 的状态机 ──
-const atCtx = { selfNickname: '小软', botName: '小软', selfId: '3844064724' };
+// 身份用占位值：本仓库是公开的，测试数据里不必出现真实的 QQ 号/昵称。
+const atCtx = { selfNickname: '小软', botName: '小软', selfId: '10000' };
 const chatCfg = {
   contextTier: 2, randomPercent: 0,
   keywords: ['小软'], historyCount: 80,

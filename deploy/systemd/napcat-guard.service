@@ -1,0 +1,9 @@
+[Unit]
+Description=NapCat 掉线守护（被踢下线 / 容器异常时告警）
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/qq
+ExecStart=/opt/qq/napcat-guard.sh
