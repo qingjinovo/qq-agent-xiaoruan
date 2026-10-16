@@ -156,14 +156,12 @@ persona-*.md              两份角色卡示例
 ```bash
 git clone <本仓库> qq-agent && cd qq-agent
 
-# 1) 建目录与 .env
+# 1) 建目录 + 从模板生成 .env（.env 不入库，每个部署实例各有一份）
 mkdir -p deploy/data deploy/plugins deploy/napcat/config deploy/napcat/QQ
-cat > deploy/.env <<'EOF'
-NAPCAT_UID=1000
-NAPCAT_GID=1000
-WEBUI_TOKEN=换成你自己的随机串
-QQ_ACCOUNT=你的QQ号
-EOF
+cp deploy/.env.example deploy/.env
+# 然后编辑 deploy/.env，至少改这两项：
+#   WEBUI_TOKEN   自己生成随机串：openssl rand -hex 20
+#   QQ_ACCOUNT    要登录的 QQ 号（留空也行，启动后扫码）
 chown -R 1000:1000 deploy/napcat
 
 # 2) 启动
@@ -263,7 +261,25 @@ plugins/<插件名>/
 校验与分发由上游市场服务完成。`tools/install-market-plugins.py` 是本仓库写的批量安装脚本：
 
 ```bash
-python tools/install-market-plugins.py CODE1 CODE2 CODE3
+# 本实例在用的三个插件（口令 → 插件）
+python tools/install-market-plugins.py 3XT9L6 PR3P6D BS4XZ3
+```
+
+| 口令 | 插件 | 做什么 | 作者 |
+|---|---|---|---|
+| `BS4XZ3` | 分层会话记忆 | 把聊天压成日块索引，能回忆很久以前的事；平常不进提示词、不花 token，问旧事才检索 | 猩星 |
+| `PR3P6D` | 人设存档隔离 | 给每个人设一套独立的群存档与群友记忆，换人设不会被上一套带跑 | 一只咩羊 |
+| `3XT9L6` | 本地知识库 | 丢 txt/md 进 `data/knowledge-base/` 就会；回答前先翻本地，翻不到再上网，搜到的存回本地 | Anagkazo |
+
+> **为什么这三个插件不在仓库里**：它们是**第三方作品**，`plugin.json` 里没有声明
+> 任何开源许可（作者分别是上面三位）。在没有明确授权的情况下再分发是不合适的，
+> 所以这里给的是**市场口令** —— 装的时候走官方渠道，代码归原作者。
+
+安装后自检：
+
+```bash
+curl -s http://127.0.0.1:3210/api/skills | python3 -m json.tool | head -20
+# 期望看到 "total": 3, "active": 3
 ```
 
 ### 角色卡
@@ -273,6 +289,106 @@ python tools/install-market-plugins.py CODE1 CODE2 CODE3
 
 > 角色卡里**不要**写"忽略限制/生成露骨内容"这类内容：项目在 `buildSystemPrompt`
 > 里硬编码了安全规则且排在角色卡之后，此类指令不会生效。
+
+### 配置模板
+
+`deploy/config.example.json` 是**脱敏后的真实配置**（由
+`tools/export-config-template.py` 从运行实例导出），拿它对照着配最快：
+
+- 所有密钥、QQ 号、群号、本地路径都已换成 `<占位符>`
+- 文件开头的 `_需要你自己填的` 列出了必须自己填的项
+- `persona.roleText` 故意留空 —— 角色卡由 `persona-*.md` 单独维护，
+  放进配置会变成两份副本，改一处忘一处就不同步
+- `globalBlocklist` / `blocklist` 已清空（原值是第三方号码）
+
+导入方式：把它填好后覆盖 `deploy/data/config.json`，再重启 qq-agent。
+
+---
+
+## 协作流程（fork → 改 → PR → 上线）
+
+这个仓库可以用标准的 fork 流程多人协作。
+
+### 贡献者
+
+```bash
+git clone https://github.com/<你的账号>/qq-agent-xiaoruan.git
+cd qq-agent-xiaoruan
+git checkout -b fix/你改的东西
+
+# ── 改东西 ──
+# 注意：README.md 与 .gitignore 等是**生成物**，
+#      改文档请改 tools/repo-readme.md（见下文）
+
+# 本地自测（不需要服务器）
+node tools/test-chat-window-v5.mjs      # 窗口判定/概率：35 项
+node tools/test-window-timing.mjs       # 窗口计时：21 项
+python tools/check-modules.py app/src   # 模块依赖图
+
+git add -A && git commit -m "说明你改了什么、为什么"
+git push origin fix/你改的东西
+# 然后在 GitHub 上开 PR
+```
+
+**改之前建议先在本地跑起来**（不用服务器、不用 QQ）：
+桌面版直接双击 `app/启动QQ机器人.bat`，或容器跑 `deploy/`。改提示词类的逻辑时，
+`tools/audit-persona.py` 能看出角色卡被注入了几次。
+
+### 维护者（合并之后上线）
+
+合并 PR 之后，服务器不会自动更新 —— 需要手工同步。流程：
+
+```bash
+# 1) 本机拉取合并后的仓库（本地 repo/ 目录就是那个 git 仓库）
+cd repo && git pull
+
+# 2) 把改动同步到"服务器版源码"目录，并核对差异
+#    ★ 关键：不要整目录覆盖上传，先 diff 看清改了哪些文件
+diff -r repo/app/src server-src/qq-agent/src
+
+# 3) 只上传变更的文件（逐文件传，避免把不该动的覆盖掉）
+python tools/ssh_exec.py put <host> root 22 repo/app/src/prompt.js /opt/qq/qq-agent/src/prompt.js
+
+# 4) 上传后**先验证再重建**（顺序不能反）
+#    语法检查 + 模块依赖图，任一不过就别重建
+python tools/check-modules.py /opt/qq/qq-agent/src     # 在服务器上跑
+
+# 5) 重建容器（★ 必须 --no-cache，构建缓存会给你旧代码）
+cd /opt/qq
+docker compose -f docker-compose.yml -f docker-compose.platform.yml build --no-cache qq-agent
+docker compose -f docker-compose.yml -f docker-compose.platform.yml up -d --force-recreate qq-agent
+
+# 6) 验证（三项都要看）
+docker ps --format '{{.Names}} {{.Status}}'                    # Up，不是 Restarting
+curl -s http://127.0.0.1:3210/api/status | head -c 200          # onebot connected
+curl -s http://127.0.0.1:3210/api/skills | head -c 200          # 插件还在（total: 3）
+```
+
+> ⚠️ **两件事千万别做**：
+> 1. **别在服务器上直接改代码**。服务器上的改动不在版本控制里，下次谁
+>    按仓库重新部署就没了。要改就改仓库、走 PR。
+> 2. **别用仓库目录整目录覆盖服务器**。仓库里的是"上游 0.4.0 + 本仓库改动"，
+>    而服务器上可能还有未回流的本地改动 —— 之前就因为整目录覆盖丢过东西。
+>    先 `diff`，再决定传哪些文件。
+
+### 回滚
+
+上线前建议先备份：
+
+```bash
+cd /opt/qq
+tar czf /root/backup-src-$(date +%m%d-%H%M).tar.gz qq-agent/src qq-agent/ui
+tar czf /root/backup-data-$(date +%m%d-%H%M).tar.gz qq-agent-data
+```
+
+出问题就解回去（源码回滚 + 无缓存重建）：
+
+```bash
+tar xzf /root/backup-src-<时间戳>.tar.gz -C /opt/qq
+cd /opt/qq && docker compose -f docker-compose.yml -f docker-compose.platform.yml \
+  build --no-cache qq-agent && \
+docker compose -f docker-compose.yml -f docker-compose.platform.yml up -d --force-recreate qq-agent
+```
 
 ---
 

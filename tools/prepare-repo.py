@@ -15,6 +15,7 @@ prepare-repo.py —— 准备要发布到 GitHub 的仓库内容
   --force-readme  即使检测到 README 有未同步的手工改动，也照常覆盖
 """
 
+import hashlib
 import io
 import os
 import re
@@ -91,6 +92,37 @@ def _first_diff(a, b, name_a="模板", name_b="README", limit=8):
     return "\n".join(out)
 
 
+def _norm(s):
+    """比较用归一化：忽略行尾空白与 CRLF，避免换行/空格差异造成误判。"""
+    return "\n".join(line.rstrip() for line in s.replace("\r\n", "\n").split("\n")).strip()
+
+
+# 生成物里嵌入的来源标记。它记录"这份 README 是从哪个版本的模板生成的"。
+# 有了它，守卫就能区分两种完全不同的情况：
+#   · 标记 == 当前模板哈希 且 内容不同  → README 被手改了      → 拦住
+#   · 标记 != 当前模板哈希 且 内容不同  → 模板被编辑了（正常）  → 放行
+# 没有这个标记就只能靠"两者是否相同"判断，会把"模板正常前进"也误拦。
+GENERATED_MARKER_FMT = "<!-- generated-from: tools/repo-readme.md sha256:{hash} -->"
+GENERATED_MARKER_RE = re.compile(
+    r"<!--\s*generated-from:\s*tools/repo-readme\.md\s+sha256:([0-9a-f]{64})\s*-->")
+
+
+def template_hash(text):
+    """模板内容的指纹（归一化后计算，避免换行风格影响）。"""
+    return hashlib.sha256(_norm(text).encode("utf-8")).hexdigest()
+
+
+def marker_hash_of(text):
+    """取出生成物里记录的上游模板哈希；没有标记返回 None。"""
+    m = GENERATED_MARKER_RE.search(text)
+    return m.group(1) if m else None
+
+
+def render_readme(template_text):
+    """模板 → 生成物：在开头插入来源标记（模板自身不带标记）。"""
+    return GENERATED_MARKER_FMT.format(hash=template_hash(template_text)) + "\n" + template_text
+
+
 def guard_generated_readme(out_dir, template_path, force=False):
     """
     覆盖 README.md 之前的手工改动守卫。
@@ -128,60 +160,70 @@ def guard_generated_readme(out_dir, template_path, force=False):
     disk_text = read_text(readme)
     snapshot = (tmpl_text, disk_text)
 
-    # 模板与磁盘完全一致 → 不可能有手工改动
-    if tmpl_text == disk_text:
+    # 内容等价（忽略行尾空白/换行风格）→ 无事可做
+    if _norm(tmpl_text) == _norm(disk_text):
         return True, "模板与已生成内容一致", snapshot
 
     if force:
         return True, "已指定 --force-readme，强制覆盖", snapshot
 
+    # ── 判定方向（关键）──
+    # 生成物开头带 `<!-- generated-from: ... sha256:H -->`，H = 生成它的那版模板的指纹。
+    #   · H == 当前模板指纹 且内容不同 → README 被手改了        → 拦住
+    #   · H != 当前模板指纹 且内容不同 → 模板被编辑了（正常开发）→ 放行
+    tmpl_h = template_hash(tmpl_text)
+    marker_h = marker_hash_of(disk_text)
+
+    if marker_h is not None and marker_h != tmpl_h:
+        return True, ("模板已更新（指纹 %s… → %s…），README 重新生成"
+                      % (marker_h[:8], tmpl_h[:8])), snapshot
+
     findings = []
 
-    # ── 层 1：未提交的手工改动 ──
-    if os.path.isdir(os.path.join(out_dir, ".git")):
-        r = _git(out_dir, "diff", "--quiet", "--", "README.md")
-        if r is not None and r[0] not in (0, None):
-            findings.append(
-                "  [1] README.md 有**未提交**的改动 —— 工作区版本与最后一次提交不同。\n"
-                "      这通常是在本地直接编辑了 README.md（而不是模板）。")
-
-        # ── 层 2：已提交，但没回写模板（网页端编辑会命中这层）──
-        r2 = _git(out_dir, "show", "HEAD:README.md")
-        if r2 is not None and r2[0] == 0:
-            head_text = r2[1]
-            if head_text != tmpl_text:
-                findings.append(
-                    "  [2] 最后一次提交里的 README.md 与当前模板**不一致** ——\n"
-                    "      说明有人在 README.md 上直接改并提交了，但没把改动同步回模板。\n"
-                    "      （在 GitHub 网页上编辑 README 就是这种情况）")
-    else:
+    if marker_h is not None:
+        # 有标记且与当前模板一致，内容却不同 → 一定是在 README 上直接改的
         findings.append(
-            "  [3] 输出目录不是 git 仓库，无法用提交历史判断来源；\n"
-            "      只能按'磁盘上的 README 与模板不同'来判定。")
+            "  [A] 现有 README.md 里记录着「由当前模板生成」（指纹一致），"
+            "但**内容与模板不同**。\n"
+            "      说明有人直接改了 README.md 而不是模板。")
+    else:
+        # 无来源标记（旧生成物 / 别人 clone 的）→ 退回比对提交历史的旧判据
+        if os.path.isdir(os.path.join(out_dir, ".git")):
+            r = _git(out_dir, "diff", "--quiet", "--", "README.md")
+            if r is not None and r[0] not in (0, None):
+                findings.append(
+                    "  [1] README.md 有**未提交**的改动 —— 工作区版本与最后一次提交不同。")
+            r2 = _git(out_dir, "show", "HEAD:README.md")
+            if r2 is not None and r2[0] == 0 and _norm(r2[1]) != _norm(tmpl_text):
+                findings.append(
+                    "  [2] 最后一次提交里的 README.md 与当前模板**不一致**。")
+        if not findings:
+            # 没标记也没检出改动 → 当作"模板前进"，放行
+            return True, "README 无来源标记，按模板前进处理", snapshot
 
     if not findings:
         return True, "未检出未同步的手工改动", snapshot
 
     print("\n" + "!" * 68)
-    print("!!  已阻止覆盖 README.md —— 检测到未同步的手工改动")
+    print("!!  已阻止覆盖 README.md —— 检测到直接改生成物的痕迹")
     print("!" * 68)
     for f in findings:
         print(f)
 
-    # 层 3 的兜底：无论哪层命中，都把"模板 vs 已存在内容"的差异列出来
     print("\n  模板(tools/repo-readme.md) 与 现有 README.md 的差异:")
-    print(_first_diff(tmpl_text, disk_text))
+    print(_first_diff(tmpl_text, disk_text, name_b="README"))
 
     print("""
   怎么处理（二选一）:
-    A) 把手工改动同步回模板（推荐，改动会保留）
+    A) 把改动同步回模板（推荐，改动会保留）
          在 tools/repo-readme.md 里做同样的修改，然后重新运行本脚本
-    B) 确认这些手改可以丢弃，强制覆盖
+    B) 确认这些改动可以丢弃，强制覆盖
          python tools/prepare-repo.py --force-readme
 
-  注意：README.md 是生成物，直接改它没有意义 —— 请改模板。
+  注意：README.md 是生成物（开头那行 generated-from 标记就是证据），
+       直接改它没有意义 —— 请改模板。
 """)
-    return False, "检测到未同步的手工改动，已中止（未覆盖）", snapshot
+    return False, "检测到直接改生成物的痕迹，已中止（未覆盖）", snapshot
 
 
 def main():
@@ -375,6 +417,32 @@ networks:
     write(os.path.join(deploy, "docker-compose.yml"), compose)
     print("   deploy/docker-compose.yml")
 
+    # ── 4a. .env 模板（compose 靠它取 UID/GID 与凭据）──
+    # 没有这个文件，拿到仓库的人会卡在"docker-compose.yml 里引用的变量是什么"。
+    env_example = """# QQ Agent 部署变量 —— 复制成 .env 后填写
+#   cp deploy/.env.example deploy/.env && 编辑它
+# .env **必须留在服务器上、不要提交**（.gitignore 已排除；它含 WebUI 口令）。
+
+# ── NapCat 容器 ──
+# 容器内进程的 UID/GID。用 `id -u` / `id -g` 查当前用户；
+# root 用户是 0 0。写错会导致 napcat/QQ 目录权限不对、登不上。
+NAPCAT_UID=1000
+NAPCAT_GID=1000
+
+# NapCat WebUI 的访问口令（登录 WebUI 改配置/扫码都要它）。
+# 自己生成一个随机串，别用示例值：
+#   openssl rand -hex 20
+# 注意：换这个值后，napcat 容器要重建才生效；
+#      napcat-guard.sh 会从本文件读取，不用改脚本。
+WEBUI_TOKEN=change-me-to-a-random-string
+
+# ── 机器人账号 ──
+# 要登录的 QQ 号。留空则 NapCat 启动后停在扫码页，先扫码也行。
+QQ_ACCOUNT=
+"""
+    write(os.path.join(deploy, ".env.example"), env_example)
+    print("   deploy/.env.example")
+
     # ── 4b. 运维脚本（已脱敏：凭据从 .env 读，不写死在文件里） ──
     print("\n=== 4b. 收集运维脚本 ===")
     ops_src = os.path.join(WS, "ops-sanitized", "ops-sanitized")
@@ -466,17 +534,19 @@ __pycache__/
     # README 同时也是**人手会改**的文件（网页端编辑过），所以覆盖前的检查
     # 放在清理目录之前（第 0b 步）—— 那时输出目录里还留着上一版 README 可供比对。
     if os.path.exists(tmpl):
-        shutil.copy2(tmpl, os.path.join(OUT, "README.md"))
+        # 渲染时在开头插入来源标记（记录本份 README 由哪版模板生成），
+        # 守卫下一次据此判断"是模板前进了"还是"README 被手改了"。
+        write(os.path.join(OUT, "README.md"), render_readme(read_text(tmpl)))
         extra = ""
         if readme_snapshot:
             tmpl_before, disk_before = readme_snapshot
-            if disk_before != tmpl_before:
+            if _norm(disk_before) != _norm(tmpl_before):
                 extra = "（原 README %d 字节 → 新 %d 字节，内容已更新）" % (
-                    len(disk_before), os.path.getsize(tmpl))
+                    len(disk_before), os.path.getsize(os.path.join(OUT, "README.md")))
             else:
                 extra = "（内容无变化）"
         print("   README.md（来自 tools/repo-readme.md，%d 字节%s）"
-              % (os.path.getsize(tmpl), extra))
+              % (os.path.getsize(os.path.join(OUT, "README.md")), extra))
     else:
         print("   ⚠️ 找不到 tools/repo-readme.md，README 未生成")
 
