@@ -305,89 +305,100 @@ curl -s http://127.0.0.1:3210/api/skills | python3 -m json.tool | head -20
 
 ---
 
-## 协作流程（fork → 改 → PR → 上线）
+## 协作流程（分支 → 部署实测 → PR → 合并）
 
-这个仓库可以用标准的 fork 流程多人协作。
+多人协作时，**服务器不从本地推文件，而是从 GitHub 拉取**。
+本仓库自带部署脚本 `tools/qqdeploy.py`（服务器上装为 `/usr/local/bin/qqdeploy`），
+它把"下载 → 校验 → 重建 → 健康检查 → 失败自动回滚"整条链路固化下来。
 
-### 贡献者
+### 为什么不让服务器直接当编辑环境
 
-```bash
-git clone https://github.com/<你的账号>/qq-agent-xiaoruan.git
-cd qq-agent-xiaoruan
-git checkout -b fix/你改的东西
+服务器上的改动**不在版本控制里**。真发生过一次：升级到 0.4.0 时全量替换源码，
+把只在旧版上实现过的"连续对话窗口"整个弄丢了（配置项还在、功能没了，表现为
+"@ 之后没反应"）。所以规矩是：**改动一律先有 git 副本，再部署**。
 
-# ── 改东西 ──
-# 注意：README.md 与 .gitignore 等是**生成物**，
-#      改文档请改 tools/repo-readme.md（见下文）
-
-# 本地自测（不需要服务器）
-node tools/test-chat-window-v5.mjs      # 窗口判定/概率：35 项
-node tools/test-window-timing.mjs       # 窗口计时：21 项
-python tools/check-modules.py app/src   # 模块依赖图
-
-git add -A && git commit -m "说明你改了什么、为什么"
-git push origin fix/你改的东西
-# 然后在 GitHub 上开 PR
-```
-
-**改之前建议先在本地跑起来**（不用服务器、不用 QQ）：
-桌面版直接双击 `app/启动QQ机器人.bat`，或容器跑 `deploy/`。改提示词类的逻辑时，
-`tools/audit-persona.py` 能看出角色卡被注入了几次。
-
-### 维护者（合并之后上线）
-
-合并 PR 之后，服务器不会自动更新 —— 需要手工同步。流程：
+### 贡献者（有服务器权限时）
 
 ```bash
-# 1) 本机拉取合并后的仓库（本地 repo/ 目录就是那个 git 仓库）
-cd repo && git pull
+git clone https://github.com/viuuro/qq-agent-xiaoruan.git && cd qq-agent-xiaoruan
+git checkout -b feat/你的改动
 
-# 2) 把改动同步到"服务器版源码"目录，并核对差异
-#    ★ 关键：不要整目录覆盖上传，先 diff 看清改了哪些文件
-diff -r repo/app/src server-src/qq-agent/src
+# ── 改代码 ──
+# 注意：README.md / .gitignore / .gitattributes 是**生成物**，
+#      改文档请改 tools/repo-readme.md（否则下次生成会被守卫拦下）
 
-# 3) 只上传变更的文件（逐文件传，避免把不该动的覆盖掉）
-python tools/ssh_exec.py put <host> root 22 repo/app/src/prompt.js /opt/qq/qq-agent/src/prompt.js
+# ── 本地自测（不需要服务器、不需要 QQ）──
+cd app && npm install && node src/server.js    # 控制台 http://127.0.0.1:3210
+cd .. && node tools/test-chat-window-v5.mjs    # 窗口判定/概率：35 项
+       node tools/test-window-timing.mjs       # 窗口计时：21 项
+       python tools/check-modules.py app/src   # 模块依赖图
 
-# 4) 上传后**先验证再重建**（顺序不能反）
-#    语法检查 + 模块依赖图，任一不过就别重建
-python tools/check-modules.py /opt/qq/qq-agent/src     # 在服务器上跑
-
-# 5) 重建容器（★ 必须 --no-cache，构建缓存会给你旧代码）
-cd /opt/qq
-docker compose -f docker-compose.yml -f docker-compose.platform.yml build --no-cache qq-agent
-docker compose -f docker-compose.yml -f docker-compose.platform.yml up -d --force-recreate qq-agent
-
-# 6) 验证（三项都要看）
-docker ps --format '{{.Names}} {{.Status}}'                    # Up，不是 Restarting
-curl -s http://127.0.0.1:3210/api/status | head -c 200          # onebot connected
-curl -s http://127.0.0.1:3210/api/skills | head -c 200          # 插件还在（total: 3）
+git add -A && git commit -m "说明改了什么、为什么"
+git push origin feat/你的改动
 ```
 
-> ⚠️ **两件事千万别做**：
-> 1. **别在服务器上直接改代码**。服务器上的改动不在版本控制里，下次谁
->    按仓库重新部署就没了。要改就改仓库、走 PR。
-> 2. **别用仓库目录整目录覆盖服务器**。仓库里的是"上游 0.4.0 + 本仓库改动"，
->    而服务器上可能还有未回流的本地改动 —— 之前就因为整目录覆盖丢过东西。
->    先 `diff`，再决定传哪些文件。
+### 贡献者（有服务器权限时）：部署到服务器实测
+
+```bash
+ssh dev@<服务器>                 # 用 SSH 密钥登录，不需要密码
+
+sudo qqdeploy --dry-run feat/你的改动   # ① 先演练：只构建镜像，不动线上
+sudo qqdeploy feat/你的改动             # ② 正式部署（约 4 分钟）
+sudo qqdeploy --status                  # ③ 看结果与健康状态
+```
+
+部署脚本会依次做：取锁（防并发）→ 从 GitHub 下载该分支 → 语法与模块依赖校验
+→ 生成该 release 的 compose → 切换 `current` 软链 → 无缓存重建 → 健康检查
+（容器在跑 / OneBot 已连 / 插件未丢）。**校验或健康检查不过会自动切回上一版**。
+
+然后去 QQ 群实测。有问题就改代码、再推、再 `sudo qqdeploy` 一次。
+
+> ⚠️ **两条硬规矩**
+> 1. **同一时刻只有一个人部署。** 脚本有 `flock` 独占锁，第二个会被明确拒绝 ——
+>    看到"另一个部署正在进行中"就等一下。
+>    （服务器只有 1.6G 内存，跑不了两个实例；同一个 QQ 号也只能登一处。）
+> 2. **不要手改 `/opt/qq/current` 或 `releases/` 里的文件。** 那是部署产物，
+>    手改脱离版本控制，下次部署即丢失。要改就走分支。
+
+### 维护者：合并 PR
+
+实测通过后，贡献者开 PR；确认无误合并到 `main`。合并后服务器**不会自动更新**：
+
+```bash
+ssh root@<服务器>
+sudo qqdeploy main          # 与仓库 main 对齐
+sudo qqdeploy --status      # 确认
+```
 
 ### 回滚
 
-上线前建议先备份：
+部署脚本每次都会保留历史版本，回滚是**切软链 + 重建**，不需要重新下载：
 
 ```bash
-cd /opt/qq
-tar czf /root/backup-src-$(date +%m%d-%H%M).tar.gz qq-agent/src qq-agent/ui
-tar czf /root/backup-data-$(date +%m%d-%H%M).tar.gz qq-agent-data
+sudo qqdeploy --rollback              # 回到上一个部署过的版本
+sudo qqdeploy --rollback <commit-sha> # 回到指定版本（需仍在 releases/ 里）
+sudo qqdeploy --list                  # 看有哪些版本可回
 ```
 
-出问题就解回去（源码回滚 + 无缓存重建）：
+脚本对"构建失败"和"健康检查不过"都会**自动回滚**，所以正常情况下你不需要手动操作；
+`--rollback` 是给"部署成功但行为不对"这种情况用的。
+
+`releases/` 默认保留最近 8 个版本，数据目录（`qq-agent-data`、`qq-agent-plugins`）
+始终是独立挂载，重建容器不会触碰。
+
+### 服务器权限模型
+
+| 项 | 说明 |
+|---|---|
+| 账号 | 普通用户 `dev`（uid 1000，属主 docke 组），**不给 root 密码** |
+| 登录 | 仅 SSH 公钥（`~dev/.ssh/authorized_keys`） |
+| sudo | **只放行 `/usr/local/bin/qqdeploy` 一条命令**，等价于"能部署代码"，不是完整 root |
+| 权限自检 | `sudo -l -U dev` 可核对；`sudo -n bash` / `sudo -n cat /etc/shadow` 应当被拒绝 |
+
+一次性安装（管理员执行，幂等）：
 
 ```bash
-tar xzf /root/backup-src-<时间戳>.tar.gz -C /opt/qq
-cd /opt/qq && docker compose -f docker-compose.yml -f docker-compose.platform.yml \
-  build --no-cache qq-agent && \
-docker compose -f docker-compose.yml -f docker-compose.platform.yml up -d --force-recreate qq-agent
+sudo bash tools/setup-deploy-access.sh    # 见文件头的说明
 ```
 
 ---
@@ -537,6 +548,19 @@ systemctl list-timers napcat-guard.timer           # 下次检查时间
     任一不一致就停下并打印差异。见 `guard_generated_readme()`。
     另一个容易忽略的点：**守卫必须跑在"清理输出目录"之前** —— 清理一执行，
     用于比对的旧文件就没了。
+11. **`docker compose` 的容器归属由「项目名」决定，不是由文件名决定**：
+    线上容器原本属于项目 `qq`（取自工作目录名）。用别的目录里的 compose 文件去
+    `up -d` 时，项目名不同 → compose 认为该"新建"而不是"替换"，于是报
+    `Conflict. The container name "/qq-agent" is already in use`。
+    部署脚本里必须显式 `-p <项目名>` 与线上对齐（`qqdeploy` 会自动读容器标签校准）。
+12. **`docker compose` 会把 `-f` 列出的所有文件合并后整体校验**：
+    用一份"只管 qq-agent"的 compose 叠加平台覆写文件（里面有 napcat 的 shm_size），
+    会报 `service "napcat" has neither an image nor a build context specified`，
+    整个构建失败。要么让每个 compose 自包含，要么别叠。
+13. **服务器到 GitHub 的 HTTPS 可能被墙，但 API 通**：本项目所在网络
+    `git clone https://github.com/...` 直接失败，而 `api.github.com` 正常。
+    所以部署走 `api.github.com/repos/<owner>/<repo>/tarball/<sha>` 下载，
+    不依赖 git 协议（未认证限额 60 次/小时，每次部署只用 1~2 次）。
 
 ---
 
