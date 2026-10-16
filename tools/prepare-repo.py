@@ -7,19 +7,24 @@ prepare-repo.py —— 准备要发布到 GitHub 的仓库内容
   · **绝不收** data/ 下的任何东西（config.json 含明文 API Key、还有聊天存档/记忆/会话记录）
   · 保留上游 MIT LICENSE 与版权声明（这是硬性要求）
   · app/src/app.js 打上"控制台绑定地址可配置"补丁，否则容器里端口映射不通
+  · 覆盖 README.md 前先检查有没有未同步的手工改动（见 guard_generated_readme）
 
-用法: python tools/prepare-repo.py [输出目录]
+用法:
+  python tools/prepare-repo.py [输出目录] [--force-readme]
+
+  --force-readme  即使检测到 README 有未同步的手工改动，也照常覆盖
 """
 
 import io
 import os
 import re
 import shutil
+import subprocess
 import sys
 
 WS = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 APP = os.path.join(WS, "resources", "app")
-OUT = sys.argv[1] if len(sys.argv) > 1 else os.path.join(WS, "repo")
+OUT = os.path.join(WS, "repo")     # 可被 main() 的命令行参数覆盖
 
 OLD_LISTEN = "server.listen(port, '127.0.0.1', () => {"
 NEW_LISTEN = "server.listen(port, process.env.QQ_AGENT_BIND_HOST || '127.0.0.1', () => {"
@@ -52,7 +57,140 @@ def copy_tree(src, dst, skip=()):
     return n
 
 
+def read_text(p):
+    with io.open(p, "r", encoding="utf-8", errors="replace") as fh:
+        return fh.read()
+
+
+def _git(repo, *args):
+    """跑一条 git 命令，返回 (returncode, stdout, stderr)。git 不可用时返回 None。"""
+    try:
+        p = subprocess.run(["git", "-C", repo] + list(args),
+                           capture_output=True, text=True,
+                           encoding="utf-8", errors="replace")
+        return p.returncode, p.stdout or "", p.stderr or ""
+    except FileNotFoundError:
+        return None
+
+
+def _first_diff(a, b, name_a="模板", name_b="README", limit=8):
+    """给出两份文本前几处差异的紧凑摘要，供用户判断要不要同步。"""
+    la, lb = a.splitlines(), b.splitlines()
+    out, shown = [], 0
+    for i in range(max(len(la), len(lb))):
+        x = la[i] if i < len(la) else "<无此行>"
+        y = lb[i] if i < len(lb) else "<无此行>"
+        if x != y:
+            out.append("      第 %d 行:" % (i + 1))
+            out.append("        %s: %s" % (name_a, x[:110]))
+            out.append("        %s: %s" % (name_b, y[:110]))
+            shown += 1
+            if shown >= limit:
+                out.append("      …（只显示前 %d 处）" % limit)
+                break
+    return "\n".join(out)
+
+
+def guard_generated_readme(out_dir, template_path, force=False):
+    """
+    覆盖 README.md 之前的手工改动守卫。
+
+    背景：本仓库的 README.md 是从 tools/repo-readme.md **生成**的。
+    直接改 GitHub 网页上的 README.md（或在本地改 README.md 而不改模板）时，
+    下一次生成会把这些手改**静默覆盖掉** —— 真实发生过一次。
+
+    三层检测（只要有任意一层判定"有未同步的手工改动"就拦下来）：
+      1) 未提交改动：`git diff --quiet -- README.md` 非 0 → 工作区里的 README 有手改
+      2) 已提交但没回写模板：`git show HEAD:README.md` != 当前模板内容
+         （网页端编辑会落在这一层：它改了 README 却没动模板）
+      3) 连 git 都没有（没提交过 / 不是仓库）时：直接比对磁盘上的 README 与模板
+
+    Args:
+        out_dir:       输出目录（含 README.md 与 .git）
+        template_path: tools/repo-readme.md 的路径
+        force:          True 时即使检测到也照常覆盖（--force-readme）
+
+    Returns:
+        (ok, action, snapshot)
+          ok       False 表示应当中止
+          action   给日志用的一句话
+          snapshot (模板文本, 磁盘上的 README 文本)；README 不存在时为 None。
+                   调用方**必须**用返回值里的快照，别在清理目录之后再读磁盘 ——
+                   那时 README.md 可能已经被删了。
+    """
+    readme = os.path.join(out_dir, "README.md")
+    if not os.path.exists(readme):
+        return True, "首次生成（输出目录里没有 README.md）", None
+    if not os.path.exists(template_path):
+        return False, "模板不存在，拒绝覆盖已有 README", None
+
+    tmpl_text = read_text(template_path)
+    disk_text = read_text(readme)
+    snapshot = (tmpl_text, disk_text)
+
+    # 模板与磁盘完全一致 → 不可能有手工改动
+    if tmpl_text == disk_text:
+        return True, "模板与已生成内容一致", snapshot
+
+    if force:
+        return True, "已指定 --force-readme，强制覆盖", snapshot
+
+    findings = []
+
+    # ── 层 1：未提交的手工改动 ──
+    if os.path.isdir(os.path.join(out_dir, ".git")):
+        r = _git(out_dir, "diff", "--quiet", "--", "README.md")
+        if r is not None and r[0] not in (0, None):
+            findings.append(
+                "  [1] README.md 有**未提交**的改动 —— 工作区版本与最后一次提交不同。\n"
+                "      这通常是在本地直接编辑了 README.md（而不是模板）。")
+
+        # ── 层 2：已提交，但没回写模板（网页端编辑会命中这层）──
+        r2 = _git(out_dir, "show", "HEAD:README.md")
+        if r2 is not None and r2[0] == 0:
+            head_text = r2[1]
+            if head_text != tmpl_text:
+                findings.append(
+                    "  [2] 最后一次提交里的 README.md 与当前模板**不一致** ——\n"
+                    "      说明有人在 README.md 上直接改并提交了，但没把改动同步回模板。\n"
+                    "      （在 GitHub 网页上编辑 README 就是这种情况）")
+    else:
+        findings.append(
+            "  [3] 输出目录不是 git 仓库，无法用提交历史判断来源；\n"
+            "      只能按'磁盘上的 README 与模板不同'来判定。")
+
+    if not findings:
+        return True, "未检出未同步的手工改动", snapshot
+
+    print("\n" + "!" * 68)
+    print("!!  已阻止覆盖 README.md —— 检测到未同步的手工改动")
+    print("!" * 68)
+    for f in findings:
+        print(f)
+
+    # 层 3 的兜底：无论哪层命中，都把"模板 vs 已存在内容"的差异列出来
+    print("\n  模板(tools/repo-readme.md) 与 现有 README.md 的差异:")
+    print(_first_diff(tmpl_text, disk_text))
+
+    print("""
+  怎么处理（二选一）:
+    A) 把手工改动同步回模板（推荐，改动会保留）
+         在 tools/repo-readme.md 里做同样的修改，然后重新运行本脚本
+    B) 确认这些手改可以丢弃，强制覆盖
+         python tools/prepare-repo.py --force-readme
+
+  注意：README.md 是生成物，直接改它没有意义 —— 请改模板。
+""")
+    return False, "检测到未同步的手工改动，已中止（未覆盖）", snapshot
+
+
 def main():
+    force_readme = "--force-readme" in sys.argv
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    out_dir = args[0] if args else os.path.join(WS, "repo")
+    global OUT
+    OUT = out_dir
+
     if not os.path.isdir(APP):
         print("找不到应用目录: %s" % APP)
         return 1
@@ -61,6 +199,21 @@ def main():
     data_dir = os.path.join(WS, "data")
     if os.path.isdir(data_dir):
         print("   ✅ 已确认 data/ 不在收集范围内（含 API Key 与聊天记录）")
+
+    # ── 0b. README 守卫：必须在"清理旧内容"之前跑 ──
+    # 因为清理会把输出目录里的 README.md 删掉，之后就没法比对"手工改动"了。
+    # 这里先把待比较的内容读进内存，清理完再交给 5c 段使用。
+    here = os.path.dirname(os.path.abspath(__file__))
+    tmpl = os.path.join(here, "repo-readme.md")
+    readme_snapshot = None          # (磁盘上的 README 文本, 模板文本) 或 None
+    if os.path.exists(tmpl):
+        ok, why, snapshot = guard_generated_readme(OUT, tmpl, force=force_readme)
+        if not ok:
+            return 4
+        readme_snapshot = snapshot
+        print("   README 守卫: %s" % why)
+    else:
+        print("   ⚠️ 找不到 tools/repo-readme.md，README 将不生成")
 
     if os.path.isdir(OUT):
         # ⚠️ 不能整目录删 —— repo/ 是 git 仓库，rmtree 会连 .git 一起删掉，
@@ -308,13 +461,22 @@ __pycache__/
     write(os.path.join(OUT, ".gitattributes"), gitattributes)
     print("   .gitattributes（强制 LF，.bat 用 CRLF）")
 
-    # ── 5c. README ──
+    # ── 5c. README（守卫已在第 0b 步跑过，这里只落盘）──
     # 与源码一起生成，避免"重新生成内容时把文档删掉"这类事故。
-    here = os.path.dirname(os.path.abspath(__file__))
-    tmpl = os.path.join(here, "repo-readme.md")
+    # README 同时也是**人手会改**的文件（网页端编辑过），所以覆盖前的检查
+    # 放在清理目录之前（第 0b 步）—— 那时输出目录里还留着上一版 README 可供比对。
     if os.path.exists(tmpl):
         shutil.copy2(tmpl, os.path.join(OUT, "README.md"))
-        print("   README.md（来自 tools/repo-readme.md，%d 字节）" % os.path.getsize(tmpl))
+        extra = ""
+        if readme_snapshot:
+            tmpl_before, disk_before = readme_snapshot
+            if disk_before != tmpl_before:
+                extra = "（原 README %d 字节 → 新 %d 字节，内容已更新）" % (
+                    len(disk_before), os.path.getsize(tmpl))
+            else:
+                extra = "（内容无变化）"
+        print("   README.md（来自 tools/repo-readme.md，%d 字节%s）"
+              % (os.path.getsize(tmpl), extra))
     else:
         print("   ⚠️ 找不到 tools/repo-readme.md，README 未生成")
 

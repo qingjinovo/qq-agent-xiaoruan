@@ -289,8 +289,42 @@ python tools/install-market-plugins.py CODE1 CODE2 CODE3
 | `prepare-upgrade.py` | 跨版本升级前准备候选源码（复制 + 打补丁 + 依赖校验） |
 | `fix-prompt-restore.py` / `fix-prompt-final.py` | 从基线恢复源码并重新应用角色卡补丁（事故恢复用） |
 | `ops-sanitize.py` | 生成脱敏后的运维脚本（把硬编码的 WebUI token 抽成从 `.env` 读） |
-| `prepare-repo.py` | 生成本仓库内容（只收源码与文档 + 安全检查），模板在 `tools/repo-readme.md` |
+| `prepare-repo.py` | 生成本仓库内容（只收源码与文档 + 安全检查 + README 守卫），模板在 `tools/repo-readme.md` |
 | `ssh_exec.py` | 用 paramiko 执行远程命令/传文件（Windows 自带 ssh 拒绝从管道读密码，故需要它） |
+
+### ⚠️ 改 README 请改模板，不要改 `README.md`
+
+本仓库的 `README.md` 是**生成物**：
+
+```
+tools/repo-readme.md   ──(python tools/prepare-repo.py)──▶   README.md
+      ↑ 这才是源文件                                              ↑ 会被覆盖
+```
+
+直接编辑 `README.md`（包括在 GitHub 网页上编辑）**改动会在下次生成时被覆盖**。
+
+为防这类误操作，`prepare-repo.py` 在覆盖前会做**三层守卫**，任意一层判定"有未同步的
+手工改动"就**中止本次生成且不覆盖**，并打印差异与两种处理办法：
+
+| 层 | 检查 | 能抓到什么 |
+|---|---|---|
+| 1 | `git diff --quiet -- README.md` | 本地改了 `README.md` 但还没提交 |
+| 2 | `git show HEAD:README.md` ≠ 模板内容 | **改了并提交了，但没回写模板**（网页端编辑就是这种） |
+| 3 | 输出目录不是 git 仓库时，直接比对磁盘 | 无版本历史可查时的兜底 |
+
+拦下来之后两条路：
+
+```bash
+# A) 把手工改动同步回模板（推荐，改动保留）
+#    在 tools/repo-readme.md 里做同样的修改，再重新运行
+python tools/prepare-repo.py
+
+# B) 确认可以丢弃，强制覆盖
+python tools/prepare-repo.py --force-readme
+```
+
+> 这个守卫是有来历的：本仓库真发生过一次 —— 有人在 GitHub 网页上把 README 里的
+> 角色名简化了，而模板没同步；下一次生成时若不拦，那次改动就会静默消失。
 
 ---
 
@@ -381,6 +415,12 @@ systemctl list-timers napcat-guard.timer           # 下次检查时间
    要么把文档也纳入生成，要么显式跳过它。
 9. **不要对 git 工作目录做递归强删**：`shutil.rmtree()` 会把 `.git` 一起删掉，
    在 Windows 上还会因只读属性抛 `PermissionError`。清理时逐个删顶层条目并跳过 `.git`。
+10. **生成物要防手改**：只要一个文件是"生成物"，就一定会有人在它身上直接改
+    （尤其在 GitHub 网页上，改 README 比改模板顺手得多）。光写一句"请改模板"没用，
+    要在覆盖前**主动检测并中止**：比对工作区、比对最后一次提交、比对模板三者，
+    任一不一致就停下并打印差异。见 `guard_generated_readme()`。
+    另一个容易忽略的点：**守卫必须跑在"清理输出目录"之前** —— 清理一执行，
+    用于比对的旧文件就没了。
 
 ---
 
