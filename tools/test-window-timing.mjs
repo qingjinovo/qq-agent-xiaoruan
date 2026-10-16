@@ -10,9 +10,28 @@
 //  这里用假时钟重演真实调用序列，不依赖系统时间。
 //
 //  运行：node tools/test-window-timing.mjs
+//  路径自适应：本文件既能在仓库里跑（app/src/），也能在本机开发时跑
+//  （resources/app/src/）—— 写死其中一种，换台机器就挂。
 // ============================================================================
 
-import { resolveContextTier, resolveWithChatWindow, isAtMe } from '../resources/app/src/prompt.js';
+import { existsSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import path from 'node:path';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const CANDIDATES = [
+  '../app/src/prompt.js',              // 仓库结构：<root>/app/src/
+  '../resources/app/src/prompt.js',    // 本机开发结构：<root>/resources/app/src/
+  './app/src/prompt.js',               // 从仓库根目录调用时
+  './resources/app/src/prompt.js',
+];
+const rel = CANDIDATES.find((p) => existsSync(path.resolve(__dirname, p)));
+if (!rel) {
+  console.error('找不到 prompt.js。已尝试：\n  ' + CANDIDATES.join('\n  '));
+  console.error('请在仓库根目录或 tools/ 目录下运行本测试。');
+  process.exit(2);
+}
+const { resolveContextTier, resolveWithChatWindow, isAtMe } = await import(rel);
 
 const WINDOW_MS = 120_000;          // 2 分钟
 const T0 = 1_700_000_000_000;

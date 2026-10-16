@@ -8,9 +8,28 @@
 //    · 窗口外 + 没召唤 → 一定不响应（机器人平常不主动插话）
 //    · 窗口内         → 按 windowProb 决定接不接这句话
 //    · 召唤（@/关键词）→ 必响应，并开启/续期窗口
+//
+//  路径自适应：仓库结构（app/src/）与本机开发结构（resources/app/src/）都要能跑。
 // ============================================================================
 
-import { resolveWithChatWindow } from '../resources/app/src/prompt.js';
+import { existsSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import path from 'node:path';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const CANDIDATES = [
+  '../app/src/prompt.js',              // 仓库结构：<root>/app/src/
+  '../resources/app/src/prompt.js',    // 本机开发结构：<root>/resources/app/src/
+  './app/src/prompt.js',               // 从仓库根目录调用时
+  './resources/app/src/prompt.js',
+];
+const rel = CANDIDATES.find((p) => existsSync(path.resolve(__dirname, p)));
+if (!rel) {
+  console.error('找不到 prompt.js。已尝试：\n  ' + CANDIDATES.join('\n  '));
+  console.error('请在仓库根目录或 tools/ 目录下运行本测试。');
+  process.exit(2);
+}
+const { resolveWithChatWindow } = await import(rel);
 
 let pass = 0, fail = 0;
 function check(name, actual, expected) {

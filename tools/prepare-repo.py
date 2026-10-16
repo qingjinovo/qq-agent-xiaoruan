@@ -118,6 +118,22 @@ def marker_hash_of(text):
     return m.group(1) if m else None
 
 
+def strip_marker(text):
+    """
+    去掉生成物开头的来源标记行，留下"正文"。
+
+    ⚠️ 比对模板与生成物时**必须**先剥掉这行 —— 模板本身不带标记。
+    忘了剥的后果很隐蔽：两者永远判为"内容不同"，于是守卫每次都误判成
+    "有人手改了 README"，把整次生成拦下来（连与 README 无关的文件都不再写出）。
+    """
+    if not text:
+        return text
+    lines = text.split("\n")
+    if lines and GENERATED_MARKER_RE.search(lines[0]):
+        return "\n".join(lines[1:])
+    return text
+
+
 def render_readme(template_text):
     """模板 → 生成物：在开头插入来源标记（模板自身不带标记）。"""
     return GENERATED_MARKER_FMT.format(hash=template_hash(template_text)) + "\n" + template_text
@@ -158,10 +174,11 @@ def guard_generated_readme(out_dir, template_path, force=False):
 
     tmpl_text = read_text(template_path)
     disk_text = read_text(readme)
+    disk_body = strip_marker(disk_text)   # 剥掉来源标记行再比内容
     snapshot = (tmpl_text, disk_text)
 
     # 内容等价（忽略行尾空白/换行风格）→ 无事可做
-    if _norm(tmpl_text) == _norm(disk_text):
+    if _norm(tmpl_text) == _norm(disk_body):
         return True, "模板与已生成内容一致", snapshot
 
     if force:
@@ -245,17 +262,23 @@ def main():
     # ── 0b. README 守卫：必须在"清理旧内容"之前跑 ──
     # 因为清理会把输出目录里的 README.md 删掉，之后就没法比对"手工改动"了。
     # 这里先把待比较的内容读进内存，清理完再交给 5c 段使用。
+    #
+    # ⚠️ 守卫被触发时**只跳过 README**，其余文件照常生成 ——
+    #    早期版本是直接 return，结果连与 README 无关的改动（比如测试脚本）都不再写出，
+    #    排查起来很绕。最后统一以非 0 退出码提示"README 没写"。
     here = os.path.dirname(os.path.abspath(__file__))
     tmpl = os.path.join(here, "repo-readme.md")
     readme_snapshot = None          # (磁盘上的 README 文本, 模板文本) 或 None
+    readme_blocked = False
     if os.path.exists(tmpl):
         ok, why, snapshot = guard_generated_readme(OUT, tmpl, force=force_readme)
-        if not ok:
-            return 4
         readme_snapshot = snapshot
+        if not ok:
+            readme_blocked = True
         print("   README 守卫: %s" % why)
     else:
         print("   ⚠️ 找不到 tools/repo-readme.md，README 将不生成")
+        readme_blocked = True
 
     if os.path.isdir(OUT):
         # ⚠️ 不能整目录删 —— repo/ 是 git 仓库，rmtree 会连 .git 一起删掉，
@@ -533,14 +556,23 @@ __pycache__/
     # 与源码一起生成，避免"重新生成内容时把文档删掉"这类事故。
     # README 同时也是**人手会改**的文件（网页端编辑过），所以覆盖前的检查
     # 放在清理目录之前（第 0b 步）—— 那时输出目录里还留着上一版 README 可供比对。
-    if os.path.exists(tmpl):
+    if readme_blocked:
+        # 守卫拦下了：**保留原有 README**（清理时已删，这里从快照写回去），
+        # 其余文件已照常生成。最后以非 0 退出码提示。
+        if readme_snapshot:
+            write(os.path.join(OUT, "README.md"), readme_snapshot[1])
+            print("   README.md（保留原有内容，%d 字节 —— 守卫拦下了覆盖）"
+                  % os.path.getsize(os.path.join(OUT, "README.md")))
+        else:
+            print("   ⚠️ README.md 未生成（守卫拦下且无原内容可保留）")
+    elif os.path.exists(tmpl):
         # 渲染时在开头插入来源标记（记录本份 README 由哪版模板生成），
         # 守卫下一次据此判断"是模板前进了"还是"README 被手改了"。
         write(os.path.join(OUT, "README.md"), render_readme(read_text(tmpl)))
         extra = ""
         if readme_snapshot:
             tmpl_before, disk_before = readme_snapshot
-            if _norm(disk_before) != _norm(tmpl_before):
+            if _norm(strip_marker(disk_before)) != _norm(tmpl_before):
                 extra = "（原 README %d 字节 → 新 %d 字节，内容已更新）" % (
                     len(disk_before), os.path.getsize(os.path.join(OUT, "README.md")))
             else:
@@ -595,6 +627,11 @@ __pycache__/
             print("      " + b.replace(OUT, "."))
         return 3
     print("   ✅ 无 API Key、无公网 IP、无 data/ 内容")
+
+    if readme_blocked:
+        print("\n   ⚠️ 注意：README.md 本次**未被覆盖**（守卫拦下了，见上方提示）。")
+        print("      其余文件均已正常生成。处理办法见上方 A/B 两条。")
+        return 4
     return 0
 
 
