@@ -1,4 +1,4 @@
-<!-- generated-from: tools/repo-readme.md sha256:5e9253a0f5490a38b726e625d543addd0dbc6cd2392f5e03f450983af73f2567 -->
+<!-- generated-from: tools/repo-readme.md sha256:72bd95b2b23de20c52a3b48dad5d833ecf101aa2e4f479c0bfe9c62069c52875 -->
 # QQ Agent · 软协小软（定制版）
 
 ```
@@ -246,6 +246,55 @@ grep -q 'plugins:/app/plugins' deploy/docker-compose.yml && echo "挂载正常" 
 
 ---
 
+## 两种部署形态（别混用）
+
+仓库提供的是**形态 A**；如果你后来接入了 `qqdeploy`，服务器会变成**形态 B**。
+两者都合法，但**同一个服务器上只能选一种**，混用会出现"容器名已被占用"或
+"用了旧 compose 覆盖成陈旧代码"这类问题。
+
+| | 形态 A：仓库自带 compose | 形态 B：qqdeploy 管理（本项目线上） |
+|---|---|---|
+| 适用 | 全新部署、单机试跑 | 需要多人协作、频繁迭代 |
+| qq-agent 代码来自 | `app/`（仓库工作副本） | `/opt/qq/releases/<sha>/`（每次部署独立目录） |
+| 更新方式 | `git pull` + `build --no-cache` + `up -d` | `sudo qqdeploy <分支>` |
+| 版本可追溯 | 靠 git 历史 | 靠 `.deployed.json` + `releases/` |
+| 回滚 | 手工 `git checkout` + 重建 | `sudo qqdeploy --rollback`（切软链，秒级定位） |
+| napcat 管理 | 同一个 compose 文件里 | 独立 `docker-compose.napcat.yml` |
+
+### 从 A 迁到 B
+
+用 `tools/retire-legacy-compose.sh`（服务器上以 root 执行，幂等）。它做四件事：
+
+1. 生成 **`docker-compose.napcat.yml`** —— 只管理 napcat 的独立入口，
+   逐项对齐当前运行中的容器（镜像 / `shm_size: 256m` / 三个回环端口 / 两处挂载）
+2. 把旧的 `docker-compose.yml` 与 `docker-compose.platform.yml` 改名为 `*.legacy`，
+   并在文件头写入退役说明
+3. **全程不重启任何容器** —— 迁移本身对线上零影响
+4. 自检：确认旧命令已失效（会报 `compose file is invalid`，而不是静默用旧代码）、
+   新入口可解析、机器人仍健康
+
+> ⚠️ 迁到形态 B 后，**旧 compose 命令必须失效**。否则有人顺手跑
+> `docker compose -f /opt/qq/docker-compose.yml up -d`，会用旧源码覆盖线上，
+> 而且**没有明显报错** —— 本项目就踩过这个坑（源码目录与仓库不同步时，
+> 那条命令会把线上退回旧版本）。
+
+### 形态 B 里 napcat 的日常操作
+
+```bash
+docker restart napcat                    # ✅ 最简单，只影响 napcat
+
+cd /opt/qq                               # 或走 compose（改配置后）
+docker compose --env-file .env -f docker-compose.napcat.yml up -d
+docker compose --env-file .env -f docker-compose.napcat.yml logs -f
+
+# ❌ 绝对不要：
+# docker compose -f docker-compose.napcat.yml down
+#   它与 qq-agent 共用 compose 项目名（历史容器都属于该项目），
+#   down 会把整个项目的容器一起删除，qq-agent 也会消失。
+```
+
+---
+
 ## 插件与角色卡
 
 ### 插件
@@ -419,6 +468,12 @@ sudo bash tools/setup-deploy-access.sh    # 见文件头的说明
 | `ops-sanitize.py` | 生成脱敏后的运维脚本（把硬编码的 WebUI token 抽成从 `.env` 读） |
 | `prepare-repo.py` | 生成本仓库内容（只收源码与文档 + 安全检查 + README 守卫），模板在 `tools/repo-readme.md` |
 | `ssh_exec.py` | 用 paramiko 执行远程命令/传文件（Windows 自带 ssh 拒绝从管道读密码，故需要它） |
+| `qqdeploy.py` | **部署脚本**（服务器上装为 `/usr/local/bin/qqdeploy`）：从 GitHub 拉分支 → 校验 → 重建 → 健康检查 → 失败自动回滚。见「协作流程」 |
+| `setup-deploy-access.sh` | 一次性给协作者开最小权限：建 `dev` 用户 + 装 SSH 公钥 + **只放行 qqdeploy 一条 sudo** |
+| `retire-legacy-compose.sh` | 从「仓库自带 compose」迁到「qqdeploy 管理」：生成 napcat 独立入口、旧 compose 改名退役、**全程不重启容器**。见「两种部署形态」 |
+| `README-部署.md` | **协作者部署说明的源文件**（服务器 `~/README-部署.md` 由它生成；服务器 IP 用占位符，避免入仓泄露） |
+| `selfcheck-qqdeploy.py` | qqdeploy 的静态自查（未导入模块、危险 API 用法） |
+| `export-config-template.py` | 把运行中的配置导出成脱敏模板（`deploy/config.example.json` 就是这么来的） |
 
 ### ⚠️ 改 README 请改模板，不要改 `README.md`
 
